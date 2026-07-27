@@ -12,6 +12,7 @@ author_email = "kperry@aph.org"
 [tool.briefcase.app.accessiblewifi]
 formal_name = "Accessible Wifi"
 description = "Ken's wifi app"
+icon = "src/accessiblewifi/resources/accessiblewifi"
 long_description = """More details about the app should go here.
 """
 sources = [

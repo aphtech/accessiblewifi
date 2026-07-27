@@ -1,0 +1,33 @@
+<svg viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#0B6FA8"/>
+      <stop offset="100%" stop-color="#084D78"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded squircle background -->
+  <rect x="0" y="0" width="512" height="512" rx="112" ry="112" fill="url(#bg)"/>
+
+  <!-- WiFi arcs, thick and simplified for small-size legibility -->
+  <path d="M 116 240 A 200 200 0 0 1 396 240"
+        fill="none" stroke="#FFFFFF" stroke-width="34" stroke-linecap="round" opacity="0.55"/>
+  <path d="M 160 296 A 140 140 0 0 1 352 296"
+        fill="none" stroke="#FFFFFF" stroke-width="34" stroke-linecap="round" opacity="0.8"/>
+  <path d="M 206 350 A 80 80 0 0 1 306 350"
+        fill="none" stroke="#FFFFFF" stroke-width="34" stroke-linecap="round"/>
+
+  <!-- Signal dot -->
+  <circle cx="256" cy="392" r="26" fill="#FFFFFF"/>
+
+  <!-- Accessibility cue: high-contrast ring badge, bottom-right -->
+  <circle cx="392" cy="392" r="70" fill="#F2A413" stroke="#084D78" stroke-width="10"/>
+  <!-- simplified universal access glyph -->
+  <circle cx="392" cy="358" r="14" fill="#084D78"/>
+  <path d="M 392 375
+           L 392 415
+           M 360 388 L 424 388
+           M 392 415 L 372 445
+           M 392 415 L 412 445"
+        stroke="#084D78" stroke-width="12" stroke-linecap="round" fill="none"/>
+</svg>

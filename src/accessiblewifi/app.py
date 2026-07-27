@@ -82,10 +82,10 @@ class WifiNetwork:
 
 class AccessibleWifi(toga.App):
     def startup(self) -> None:
-        print("USER =", os.environ.get("USER"))
-        print("XDG_SESSION_TYPE =", os.environ.get("XDG_SESSION_TYPE"))
-        print("DBUS_SESSION_BUS_ADDRESS =", os.environ.get("DBUS_SESSION_BUS_ADDRESS"))
-        print("XDG_RUNTIME_DIR =", os.environ.get("XDG_RUNTIME_DIR"))
+        #print("USER =", os.environ.get("USER"))
+        #print("XDG_SESSION_TYPE =", os.environ.get("XDG_SESSION_TYPE"))
+        #print("DBUS_SESSION_BUS_ADDRESS =", os.environ.get("DBUS_SESSION_BUS_ADDRESS"))
+        #print("XDG_RUNTIME_DIR =", os.environ.get("XDG_RUNTIME_DIR"))
         self.networks: list[WifiNetwork] = []
         self.network_by_description: dict[str, WifiNetwork] = {}
 
