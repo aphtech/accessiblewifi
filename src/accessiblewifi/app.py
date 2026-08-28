@@ -915,8 +915,11 @@ class AccessibleWifi(toga.App):
         self.hidden_window = toga.Window(
             title="Hidden Personal or Open Wi-Fi",
             size=(600, 390),
+            resizable=True,
         )
-        self.hidden_window.content = content
+        self.hidden_window.content = toga.ScrollContainer(
+            content=content, horizontal=False, style=Pack(flex=1)
+        )
         self.hidden_window.show()
         self.hidden_ssid.focus()
 
@@ -1060,8 +1063,11 @@ class AccessibleWifi(toga.App):
         self.enterprise_window = toga.Window(
             title="Enterprise or Certificate Wi-Fi",
             size=(760, 850),
+            resizable=True,
         )
-        self.enterprise_window.content = content
+        self.enterprise_window.content = toga.ScrollContainer(
+            content=content, horizontal=False, style=Pack(flex=1)
+        )
         self.enterprise_window.show()
         self.enterprise_method_changed(self.enterprise_method)
         self.enterprise_ssid.focus()
@@ -1311,8 +1317,11 @@ class AccessibleWifi(toga.App):
         self.wep_window = toga.Window(
             title="Legacy WEP Wi-Fi",
             size=(650, 560),
+            resizable=True,
         )
-        self.wep_window.content = content
+        self.wep_window.content = toga.ScrollContainer(
+            content=content, horizontal=False, style=Pack(flex=1)
+        )
         self.wep_window.show()
         self.wep_ssid.focus()
 
