@@ -23,11 +23,15 @@ Do not run this entire program with sudo.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import re
 import shutil
+import struct
 import tempfile
 import webbrowser
+from collections.abc import Callable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,6 +41,29 @@ from toga.style.pack import COLUMN, ROW
 
 
 PORTAL_URL = "http://example.com/"
+
+# A short, quiet tick tone repeated in the background while a connection
+# attempt is in progress, so screen-reader users have a non-speech cue that
+# the app is still working during the gap between the "Connecting" and
+# connection-result announcements.
+TICK_SAMPLE_RATE = 22050
+TICK_INTERVAL_SECONDS = 1.2
+
+
+def _generate_tick_pcm() -> bytes:
+    duration_seconds = 0.08
+    frequency_hz = 900
+    frame_count = int(TICK_SAMPLE_RATE * duration_seconds)
+    samples = bytearray()
+    for index in range(frame_count):
+        time = index / TICK_SAMPLE_RATE
+        envelope = 1.0 - (index / frame_count)
+        amplitude = int(8000 * envelope * math.sin(2 * math.pi * frequency_hz * time))
+        samples += struct.pack("<h", amplitude)
+    return bytes(samples)
+
+
+TICK_PCM = _generate_tick_pcm()
 
 # Speaks status text through Orca's D-Bus service (PresentMessage) instead of
 # a screen widget, so screen-reader users hear status changes immediately
@@ -50,6 +77,74 @@ ORCA_SPEAK_COMMAND = [
 
 class NmcliError(RuntimeError):
     pass
+
+
+class RevealablePasswordInput:
+    """A single password entry paired with a "Show password" switch.
+
+    Toga's PasswordInput cannot toggle masking on the fly, so this keeps one
+    TextInput widget for the lifetime of the control and flips the
+    underlying GTK entry's visibility property when the switch changes.
+    Because it is always the same widget, the value, cursor position,
+    selection, focus, accessible name, and tab order are untouched by
+    toggling — and a screen reader only ever encounters one edit field.
+    """
+
+    def __init__(
+        self,
+        on_confirm: Callable[[toga.Widget], object] | None = None,
+        style: Pack | None = None,
+        speak_callback: Callable[[str], None] | None = None,
+    ) -> None:
+        self._speak_callback = speak_callback
+
+        self.entry = toga.TextInput(
+            on_confirm=on_confirm,
+            style=style or Pack(flex=1),
+        )
+        self._set_masked(True)
+        self.show_switch = toga.Switch(
+            "Show password",
+            on_change=self._show_changed,
+            style=Pack(margin_top=3, margin_bottom=8),
+        )
+
+        self.box = toga.Box(
+            children=[self.entry, self.show_switch],
+            style=Pack(direction=COLUMN),
+        )
+
+    def _set_masked(self, masked: bool) -> None:
+        self.entry._impl.native.set_visibility(not masked)
+
+    def _show_changed(self, widget: toga.Switch) -> None:
+        self._set_masked(not self.show_switch.value)
+        if self.show_switch.value and self._speak_callback:
+            self._speak_callback(
+                f"Password: {self.entry.value}"
+                if self.entry.value
+                else "Password is empty."
+            )
+
+    @property
+    def value(self) -> str:
+        return self.entry.value
+
+    @value.setter
+    def value(self, new_value: str) -> None:
+        self.entry.value = new_value
+
+    @property
+    def enabled(self) -> bool:
+        return self.entry.enabled
+
+    @enabled.setter
+    def enabled(self, value: bool) -> None:
+        self.entry.enabled = value
+        self.show_switch.enabled = value
+
+    def focus(self) -> None:
+        self.entry.focus()
 
 
 @dataclass(frozen=True)
@@ -97,6 +192,7 @@ class AccessibleWifi(toga.App):
         #print("XDG_RUNTIME_DIR =", os.environ.get("XDG_RUNTIME_DIR"))
         self.networks: list[WifiNetwork] = []
         self.network_by_description: dict[str, WifiNetwork] = {}
+        self._tick_command = self._detect_tick_command()
 
         self.hidden_window: toga.Window | None = None
         self.enterprise_window: toga.Window | None = None
@@ -119,9 +215,9 @@ class AccessibleWifi(toga.App):
             "Wi-Fi password:",
             style=Pack(margin_top=12, margin_bottom=5),
         )
-        self.password_input = toga.PasswordInput(
+        self.password_input = RevealablePasswordInput(
             on_confirm=self.connect_selected_network,
-            style=Pack(flex=1),
+            speak_callback=self.speak,
         )
         self.password_input.enabled = False
 
@@ -185,7 +281,7 @@ class AccessibleWifi(toga.App):
                 ),
                 self.network_selection,
                 self.password_label,
-                self.password_input,
+                self.password_input.box,
                 self.button_row(self.connect_button, self.refresh_button),
                 self.button_row(self.hidden_button, self.enterprise_button),
                 self.button_row(self.wep_button, self.restart_button),
@@ -246,6 +342,65 @@ class AccessibleWifi(toga.App):
             # Speech is a best-effort accessibility aid; never let a
             # missing Orca/D-Bus session break the underlying operation.
             pass
+
+    @staticmethod
+    def _detect_tick_command() -> list[str] | None:
+        if shutil.which("paplay"):
+            return [
+                "paplay",
+                "--raw",
+                f"--rate={TICK_SAMPLE_RATE}",
+                "--channels=1",
+                "--format=s16le",
+            ]
+        if shutil.which("aplay"):
+            return [
+                "aplay",
+                "-q",
+                "-t",
+                "raw",
+                "-r",
+                str(TICK_SAMPLE_RATE),
+                "-f",
+                "S16_LE",
+                "-c",
+                "1",
+            ]
+        return None
+
+    async def _play_tick(self) -> None:
+        if not self._tick_command:
+            return
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *self._tick_command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(process.communicate(TICK_PCM), timeout=2)
+        except Exception:
+            # The tick is a best-effort activity cue; never let a missing
+            # audio player break the underlying connection attempt.
+            pass
+
+    async def _connect_tick_loop(self) -> None:
+        while True:
+            await asyncio.sleep(TICK_INTERVAL_SECONDS)
+            await self._play_tick()
+
+    @asynccontextmanager
+    async def connecting_ticker(self):
+        """Play a repeating tick sound for the duration of the `async with`
+        block, giving screen-reader users a non-speech cue that the app is
+        still working during a Wi-Fi connection attempt."""
+        task = asyncio.create_task(self._connect_tick_loop())
+        try:
+            yield
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
     async def show_error(
         self,
@@ -602,6 +757,18 @@ class AccessibleWifi(toga.App):
             self.password_input.enabled = True
             self.connect_button.enabled = True
 
+    def focus_connected_network(self, ssid: str) -> None:
+        """Select and focus the just-connected SSID in the network list
+        without re-scanning, so screen-reader users land back on the
+        network they just joined."""
+        for description, network in self.network_by_description.items():
+            if network.ssid == ssid:
+                self.network_selection.value = description
+                break
+
+        if self.network_selection.enabled:
+            self.network_selection.focus()
+
     async def connect_selected_network(self, widget: toga.Widget) -> None:
         network = self.selected_network()
         if network is None:
@@ -658,20 +825,11 @@ class AccessibleWifi(toga.App):
             if security != "open" and not password:
                 raise NmcliError("A password is required.")
 
-            await self.delete_profile(profile)
-
             key_management = {
                 "open": None,
                 "wpa-personal": "wpa-psk",
                 "wpa3": "sae",
             }[security]
-
-            await self.add_base_profile(
-                ssid,
-                profile,
-                hidden,
-                key_management,
-            )
 
             secrets = (
                 None
@@ -679,10 +837,18 @@ class AccessibleWifi(toga.App):
                 else {"802-11-wireless-security.psk": password}
             )
 
-            await self.activate(profile, secrets)
+            async with self.connecting_ticker():
+                await self.delete_profile(profile)
+                await self.add_base_profile(
+                    ssid,
+                    profile,
+                    hidden,
+                    key_management,
+                )
+                await self.activate(profile, secrets)
             self.password_input.value = ""
             await self.handle_connection_result(ssid)
-            await self.scan_for_networks()
+            self.focus_connected_network(ssid)
         except (NmcliError, KeyError) as error:
             await self.cleanup_failed_profile(profile)
             self.set_status(f"Connection failed: {error}")
@@ -713,9 +879,9 @@ class AccessibleWifi(toga.App):
         )
         self.hidden_security.value = "WPA or WPA2 Personal"
         self.hidden_password_label = toga.Label("Wi-Fi password:")
-        self.hidden_password = toga.PasswordInput(
+        self.hidden_password = RevealablePasswordInput(
             on_confirm=self.connect_hidden,
-            style=Pack(flex=1),
+            speak_callback=self.speak,
         )
 
         content = toga.Box(
@@ -729,7 +895,7 @@ class AccessibleWifi(toga.App):
                 toga.Label("Security type:", style=Pack(margin_top=8)),
                 self.hidden_security,
                 self.hidden_password_label,
-                self.hidden_password,
+                self.hidden_password.box,
                 self.button_row(
                     toga.Button(
                         "Connect",
@@ -829,12 +995,12 @@ class AccessibleWifi(toga.App):
 
         self.enterprise_identity = toga.TextInput(style=Pack(flex=1))
         self.enterprise_anonymous = toga.TextInput(style=Pack(flex=1))
-        self.enterprise_password = toga.PasswordInput(style=Pack(flex=1))
+        self.enterprise_password = RevealablePasswordInput(speak_callback=self.speak)
         self.enterprise_ca = toga.TextInput(style=Pack(flex=1))
         self.enterprise_domain = toga.TextInput(style=Pack(flex=1))
         self.enterprise_client_cert = toga.TextInput(style=Pack(flex=1))
         self.enterprise_private_key = toga.TextInput(style=Pack(flex=1))
-        self.enterprise_key_password = toga.PasswordInput(style=Pack(flex=1))
+        self.enterprise_key_password = RevealablePasswordInput(speak_callback=self.speak)
 
         self.enterprise_inner_label = toga.Label("Inner authentication:")
         self.enterprise_password_label = toga.Label("Account password:")
@@ -864,7 +1030,7 @@ class AccessibleWifi(toga.App):
                 toga.Label("Anonymous identity, optional:", style=Pack(margin_top=8)),
                 self.enterprise_anonymous,
                 self.enterprise_password_label,
-                self.enterprise_password,
+                self.enterprise_password.box,
                 toga.Label("CA certificate path, recommended:", style=Pack(margin_top=8)),
                 self.enterprise_ca,
                 toga.Label("Authentication server domain, recommended:", style=Pack(margin_top=8)),
@@ -874,7 +1040,7 @@ class AccessibleWifi(toga.App):
                 self.enterprise_key_label,
                 self.enterprise_private_key,
                 self.enterprise_key_password_label,
-                self.enterprise_key_password,
+                self.enterprise_key_password.box,
                 self.button_row(
                     toga.Button(
                         "Connect",
@@ -1001,14 +1167,6 @@ class AccessibleWifi(toga.App):
         profile = self.profile_name(ssid, "Enterprise")
 
         try:
-            await self.delete_profile(profile)
-            await self.add_base_profile(
-                ssid,
-                profile,
-                hidden,
-                "wpa-eap",
-            )
-
             modify = [
                 "connection",
                 "modify",
@@ -1039,17 +1197,24 @@ class AccessibleWifi(toga.App):
                     ]
                 )
 
-            await self.run_nmcli(*modify, timeout=45)
-
             secrets: dict[str, str] = {}
             if eap in {"peap", "ttls"}:
                 secrets["802-1x.password"] = password
             elif key_password:
                 secrets["802-1x.private-key-password"] = key_password
 
-            await self.activate(profile, secrets or None)
+            async with self.connecting_ticker():
+                await self.delete_profile(profile)
+                await self.add_base_profile(
+                    ssid,
+                    profile,
+                    hidden,
+                    "wpa-eap",
+                )
+                await self.run_nmcli(*modify, timeout=45)
+                await self.activate(profile, secrets or None)
             await self.handle_connection_result(ssid)
-            await self.scan_for_networks()
+            self.focus_connected_network(ssid)
         except NmcliError as error:
             await self.cleanup_failed_profile(profile)
             self.set_status(f"Enterprise connection failed: {error}")
@@ -1084,9 +1249,9 @@ class AccessibleWifi(toga.App):
             style=Pack(flex=1),
         )
         self.wep_key_type.value = "Hexadecimal or ASCII key"
-        self.wep_key = toga.PasswordInput(
+        self.wep_key = RevealablePasswordInput(
             on_confirm=self.connect_wep,
-            style=Pack(flex=1),
+            speak_callback=self.speak,
         )
         self.wep_index = toga.Selection(
             items=["Key 1", "Key 2", "Key 3", "Key 4"],
@@ -1110,7 +1275,7 @@ class AccessibleWifi(toga.App):
                 toga.Label("Key type:", style=Pack(margin_top=8)),
                 self.wep_key_type,
                 toga.Label("WEP key or passphrase:", style=Pack(margin_top=8)),
-                self.wep_key,
+                self.wep_key.box,
                 toga.Label("Key index:", style=Pack(margin_top=8)),
                 self.wep_index,
                 self.button_row(
@@ -1176,34 +1341,35 @@ class AccessibleWifi(toga.App):
         profile = self.profile_name(ssid, "WEP")
 
         try:
-            await self.delete_profile(profile)
-            await self.add_base_profile(
-                ssid,
-                profile,
-                hidden,
-                "none",
-            )
+            async with self.connecting_ticker():
+                await self.delete_profile(profile)
+                await self.add_base_profile(
+                    ssid,
+                    profile,
+                    hidden,
+                    "none",
+                )
 
-            await self.run_nmcli(
-                "connection",
-                "modify",
-                "id",
-                profile,
-                "802-11-wireless-security.auth-alg",
-                auth,
-                "802-11-wireless-security.wep-key-type",
-                key_type,
-                "802-11-wireless-security.wep-tx-keyidx",
-                key_index,
-                timeout=30,
-            )
+                await self.run_nmcli(
+                    "connection",
+                    "modify",
+                    "id",
+                    profile,
+                    "802-11-wireless-security.auth-alg",
+                    auth,
+                    "802-11-wireless-security.wep-key-type",
+                    key_type,
+                    "802-11-wireless-security.wep-tx-keyidx",
+                    key_index,
+                    timeout=30,
+                )
 
-            await self.activate(
-                profile,
-                {f"802-11-wireless-security.wep-key{key_index}": key},
-            )
+                await self.activate(
+                    profile,
+                    {f"802-11-wireless-security.wep-key{key_index}": key},
+                )
             await self.handle_connection_result(ssid)
-            await self.scan_for_networks()
+            self.focus_connected_network(ssid)
         except NmcliError as error:
             await self.cleanup_failed_profile(profile)
             self.set_status(f"WEP connection failed: {error}")
@@ -1259,12 +1425,6 @@ class AccessibleWifi(toga.App):
             self.portal_button.enabled = False
             self.set_status(
                 f"Connected to {name}. Internet access is available."
-            )
-            await self.main_window.dialog(
-                toga.InfoDialog(
-                    "Internet available",
-                    f"Connected to {name}. Internet access is available.",
-                )
             )
             return
 
