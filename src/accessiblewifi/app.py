@@ -34,10 +34,14 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
+from .screen_size import ScreenSize
 
 import toga
 from toga.style import Pack
-from toga.style.pack import COLUMN, ROW
+from toga.style.pack import COLUMN, ROW, CENTER
+
+env = os.environ.copy()
+env["DISPLAY"] = env.get("DISPLAY", ":0")
 
 
 PORTAL_URL = "http://example.com/"
@@ -186,10 +190,6 @@ class WifiNetwork:
 
 class AccessibleWifi(toga.App):
     def startup(self) -> None:
-        #print("USER =", os.environ.get("USER"))
-        #print("XDG_SESSION_TYPE =", os.environ.get("XDG_SESSION_TYPE"))
-        #print("DBUS_SESSION_BUS_ADDRESS =", os.environ.get("DBUS_SESSION_BUS_ADDRESS"))
-        #print("XDG_RUNTIME_DIR =", os.environ.get("XDG_RUNTIME_DIR"))
         self.networks: list[WifiNetwork] = []
         self.network_by_description: dict[str, WifiNetwork] = {}
         self._tick_command = self._detect_tick_command()
@@ -198,78 +198,141 @@ class AccessibleWifi(toga.App):
         self.enterprise_window: toga.Window | None = None
         self.wep_window: toga.Window | None = None
 
+        screen = ScreenSize()
+        iswidth = screen.get_width()
+        isheight = screen.get_height()
+
+        TEXT_WIDTH = int(iswidth * 0.85)      # labels get more room so they don't truncate
+        CONTENT_WIDTH = int(iswidth * 0.60)   # selection + password field
+        BUTTON_WIDTH = int(iswidth * 0.28)
+
         self.instructions = toga.Label(
-            "Choose a visible network and press Connect. Use the additional "
-            "buttons for hidden, enterprise, certificate, or WEP networks.",
-            style=Pack(margin_bottom=12, flex=1),
+            "Choose a visible network and press Connect.\n"
+            "Use the additional buttons for hidden, enterprise, certificate, or WEP networks.",
+            style=Pack(width=TEXT_WIDTH, margin_bottom=6, text_align="center"),
         )
 
         self.network_selection = toga.Selection(
             items=["Press Refresh Networks to scan"],
             on_change=self.network_changed,
-            style=Pack(flex=1),
+            style=Pack(width=CONTENT_WIDTH, margin_bottom=2),
         )
         self.network_selection.enabled = False
 
         self.password_label = toga.Label(
             "Wi-Fi password:",
-            style=Pack(margin_top=12, margin_bottom=5, flex=1),
+            style=Pack(width=CONTENT_WIDTH, margin_top=4, margin_bottom=2),
         )
         self.password_input = RevealablePasswordInput(
             on_confirm=self.connect_selected_network,
             speak_callback=self.speak,
         )
         self.password_input.enabled = False
+        
+        self.password_input.box.style.width = CONTENT_WIDTH
+        self.password_input.box.style.flex = 0
+        self.password_input.box.style.margin_top = 0
+        self.password_input.box.style.margin_bottom = 2
+        for child in self.password_input.box.children:
+            child.style.flex = 0
+            child.style.margin_bottom = 0
+
+        # Standard button styles (single line)
+        btn_style_left = Pack(
+            width=BUTTON_WIDTH,
+            height=34,
+            margin_top=1,
+            margin_bottom=1,
+            margin_right=4,
+            margin_left=0,
+        )
+        btn_style_right = Pack(
+            width=BUTTON_WIDTH,
+            height=34,
+            margin_top=1,
+            margin_bottom=1,
+            margin_left=4,
+            margin_right=0,
+        )
+
+        # Taller button styles (2 lines)
+        tall_btn_style_left = Pack(
+            width=BUTTON_WIDTH,
+            height=34,
+            margin_top=1,
+            margin_bottom=1,
+            margin_right=4,
+            margin_left=0,
+        )
+        tall_btn_style_right = Pack(
+            width=BUTTON_WIDTH,
+            height=34,
+            margin_top=1,
+            margin_bottom=1,
+            margin_left=4,
+            margin_right=0,
+        )
 
         self.connect_button = toga.Button(
             "Connect to Selected Network",
             on_press=self.connect_selected_network,
             enabled=False,
-            style=Pack(flex=1, margin_right=5),
+            style=btn_style_left,
         )
         self.refresh_button = toga.Button(
             "Refresh Networks",
             on_press=self.refresh_networks,
-            style=Pack(flex=1, margin_left=5),
+            style=btn_style_right,
         )
 
+        # 2-line text with taller height
         self.hidden_button = toga.Button(
-            "Hidden Personal or Open Network",
+            "Hidden/Open Network",
             on_press=self.show_hidden_window,
-            style=Pack(flex=1, margin_right=5),
+            style=tall_btn_style_left,
         )
         self.enterprise_button = toga.Button(
-            "Enterprise or Certificate Network",
+            "Enterprise/Cert Network",
             on_press=self.show_enterprise_window,
-            style=Pack(flex=1, margin_left=5),
+            style=tall_btn_style_right,
         )
 
         self.wep_button = toga.Button(
             "Legacy WEP Network",
             on_press=self.show_wep_window,
-            style=Pack(flex=1, margin_right=5),
+            style=btn_style_left,
         )
         self.restart_button = toga.Button(
             "Restart Wi-Fi",
             on_press=self.restart_wifi,
-            style=Pack(flex=1, margin_left=5),
+            style=btn_style_right,
         )
 
         self.portal_button = toga.Button(
             "Open Wi-Fi Sign-In Page",
             on_press=self.open_portal_page,
             enabled=False,
-            style=Pack(flex=1, margin_right=5),
+            style=btn_style_left,
         )
         self.check_button = toga.Button(
             "Check Internet Again",
             on_press=self.check_internet_again,
-            style=Pack(flex=1, margin_left=5),
+            style=btn_style_right,
         )
 
         self.status_label = toga.Label(
             "Status: Ready.",
-            style=Pack(margin_top=15, flex=1),
+            style=Pack(width=TEXT_WIDTH, margin_top=4, text_align="center"),
+        )
+
+        buttons_container = toga.Box(
+            children=[
+                self.button_row(self.connect_button, self.refresh_button),
+                self.button_row(self.hidden_button, self.enterprise_button),
+                self.button_row(self.wep_button, self.restart_button),
+                self.button_row(self.portal_button, self.check_button),
+            ],
+            style=Pack(direction=COLUMN, margin_top=2, margin_bottom=2, align_items=CENTER),
         )
 
         content = toga.Box(
@@ -277,32 +340,37 @@ class AccessibleWifi(toga.App):
                 self.instructions,
                 toga.Label(
                     "Available Wi-Fi networks:",
-                    style=Pack(margin_bottom=5, flex=1),
+                    style=Pack(width=CONTENT_WIDTH, margin_top=2, margin_bottom=2),
                 ),
                 self.network_selection,
                 self.password_label,
                 self.password_input.box,
-                self.button_row(self.connect_button, self.refresh_button),
-                self.button_row(self.hidden_button, self.enterprise_button),
-                self.button_row(self.wep_button, self.restart_button),
-                self.button_row(self.portal_button, self.check_button),
+                buttons_container,
                 self.status_label,
             ],
-            style=Pack(direction=COLUMN, margin=20, flex=1),
+            style=Pack(direction=COLUMN, margin=10, align_items=CENTER),
         )
+
+        window_width = int(iswidth * 0.6)
+        window_height = int(isheight * 0.55)
 
         self.main_window = toga.MainWindow(
             title="Accessible Wi-Fi Setup",
-            size=(760, 560),
+            size=(window_width, window_height),
             resizable=True,
+            minimizable=True,
         )
-        self.main_window.content = toga.ScrollContainer(
-            content=content, horizontal=True, style=Pack(flex=1)
-        )
+        self.main_window.content = content
         self.main_window.show()
 
         asyncio.create_task(self.initial_scan())
 
+    def button_row(self, *buttons):
+        return toga.Box(
+            children=list(buttons),
+            style=Pack(direction=ROW, margin=0),
+        )
+    
     @staticmethod
     def button_row(left: toga.Button, right: toga.Button) -> toga.Box:
         return toga.Box(
