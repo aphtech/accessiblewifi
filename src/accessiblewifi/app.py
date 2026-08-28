@@ -1162,6 +1162,20 @@ class AccessibleWifi(toga.App):
             )
             return
 
+        if not ca_cert:
+            proceed = await self.main_window.dialog(
+                toga.ConfirmDialog(
+                    "No CA certificate provided",
+                    "Without a CA certificate, this app cannot verify the "
+                    "network's authentication server. A rogue access "
+                    "point broadcasting the same network name could "
+                    f"capture the username and password for {ssid}. "
+                    "Connect anyway?",
+                )
+            )
+            if not proceed:
+                return
+
         self.close_enterprise_window(widget)
         self.set_busy(True, f"Connecting to enterprise network {ssid}.")
         profile = self.profile_name(ssid, "Enterprise")
