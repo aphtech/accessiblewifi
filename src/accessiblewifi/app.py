@@ -106,12 +106,12 @@ class RevealablePasswordInput:
         self.show_switch = toga.Switch(
             "Show password",
             on_change=self._show_changed,
-            style=Pack(margin_top=3, margin_bottom=8),
+            style=Pack(margin_top=3, margin_bottom=8, flex=1),
         )
 
         self.box = toga.Box(
             children=[self.entry, self.show_switch],
-            style=Pack(direction=COLUMN),
+            style=Pack(direction=COLUMN, flex=1),
         )
 
     def _set_masked(self, masked: bool) -> None:
@@ -201,7 +201,7 @@ class AccessibleWifi(toga.App):
         self.instructions = toga.Label(
             "Choose a visible network and press Connect. Use the additional "
             "buttons for hidden, enterprise, certificate, or WEP networks.",
-            style=Pack(margin_bottom=12),
+            style=Pack(margin_bottom=12, flex=1),
         )
 
         self.network_selection = toga.Selection(
@@ -213,7 +213,7 @@ class AccessibleWifi(toga.App):
 
         self.password_label = toga.Label(
             "Wi-Fi password:",
-            style=Pack(margin_top=12, margin_bottom=5),
+            style=Pack(margin_top=12, margin_bottom=5, flex=1),
         )
         self.password_input = RevealablePasswordInput(
             on_confirm=self.connect_selected_network,
@@ -269,7 +269,7 @@ class AccessibleWifi(toga.App):
 
         self.status_label = toga.Label(
             "Status: Ready.",
-            style=Pack(margin_top=15),
+            style=Pack(margin_top=15, flex=1),
         )
 
         content = toga.Box(
@@ -277,7 +277,7 @@ class AccessibleWifi(toga.App):
                 self.instructions,
                 toga.Label(
                     "Available Wi-Fi networks:",
-                    style=Pack(margin_bottom=5),
+                    style=Pack(margin_bottom=5, flex=1),
                 ),
                 self.network_selection,
                 self.password_label,
@@ -288,7 +288,7 @@ class AccessibleWifi(toga.App):
                 self.button_row(self.portal_button, self.check_button),
                 self.status_label,
             ],
-            style=Pack(direction=COLUMN, margin=20),
+            style=Pack(direction=COLUMN, margin=20, flex=1),
         )
 
         self.main_window = toga.MainWindow(
@@ -307,7 +307,7 @@ class AccessibleWifi(toga.App):
     def button_row(left: toga.Button, right: toga.Button) -> toga.Box:
         return toga.Box(
             children=[left, right],
-            style=Pack(direction=ROW, margin_top=10),
+            style=Pack(direction=ROW, margin_top=10, flex=1),
         )
 
     async def initial_scan(self) -> None:
