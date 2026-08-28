@@ -38,6 +38,15 @@ from toga.style.pack import COLUMN, ROW
 
 PORTAL_URL = "http://example.com/"
 
+# Speaks status text through Orca's D-Bus service (PresentMessage) instead of
+# a screen widget, so screen-reader users hear status changes immediately
+# without focus moving away from whatever control they're on.
+ORCA_SPEAK_COMMAND = [
+    "busctl", "--user", "call", "--expect-reply=false",
+    "org.gnome.Orca.Service", "/org/gnome/Orca/Service",
+    "org.gnome.Orca.Service", "PresentMessage", "s",
+]
+
 
 class NmcliError(RuntimeError):
     pass
@@ -208,6 +217,35 @@ class AccessibleWifi(toga.App):
 
     def set_status(self, message: str) -> None:
         self.status_label.text = f"Status: {message}"
+        self.speak(message)
+
+    def speak(self, message: str) -> None:
+        """Announce `message` via Orca, without moving keyboard focus.
+
+        Unlike updating a label (only announced if that label happens to
+        have focus) or a dialog (steals focus and requires dismissal), this
+        goes straight to Orca over D-Bus, so status changes are reliably
+        heard by screen-reader users no matter what control they're on.
+        """
+        try:
+            asyncio.create_task(self._speak_async(message))
+        except RuntimeError:
+            pass
+
+    @staticmethod
+    async def _speak_async(message: str) -> None:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *ORCA_SPEAK_COMMAND,
+                message,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(process.communicate(), timeout=2)
+        except Exception:
+            # Speech is a best-effort accessibility aid; never let a
+            # missing Orca/D-Bus session break the underlying operation.
+            pass
 
     async def show_error(
         self,
@@ -361,6 +399,16 @@ class AccessibleWifi(toga.App):
             timeout=30,
             check=False,
         )
+
+    async def cleanup_failed_profile(self, profile_name: str) -> None:
+        """Best-effort delete of a just-created profile after a failed
+        connection attempt. Must never raise: it runs from an `except`
+        block, and letting a cleanup failure propagate would swallow the
+        real error message the user is about to be told via a dialog."""
+        try:
+            await self.delete_profile(profile_name)
+        except NmcliError:
+            pass
 
     @staticmethod
     def profile_name(ssid: str, category: str) -> str:
@@ -636,7 +684,7 @@ class AccessibleWifi(toga.App):
             await self.handle_connection_result(ssid)
             await self.scan_for_networks()
         except (NmcliError, KeyError) as error:
-            await self.delete_profile(profile)
+            await self.cleanup_failed_profile(profile)
             self.set_status(f"Connection failed: {error}")
             await self.show_error(
                 "Could not connect",
@@ -650,6 +698,7 @@ class AccessibleWifi(toga.App):
     def show_hidden_window(self, widget: toga.Widget) -> None:
         if self.hidden_window is not None:
             self.hidden_window.show()
+            self.hidden_ssid.focus()
             return
 
         self.hidden_ssid = toga.TextInput(style=Pack(flex=1))
@@ -703,6 +752,7 @@ class AccessibleWifi(toga.App):
         )
         self.hidden_window.content = content
         self.hidden_window.show()
+        self.hidden_ssid.focus()
 
     def hidden_security_changed(self, widget: toga.Selection) -> None:
         is_open = str(self.hidden_security.value) == "Open, no password"
@@ -750,6 +800,7 @@ class AccessibleWifi(toga.App):
     def show_enterprise_window(self, widget: toga.Widget) -> None:
         if self.enterprise_window is not None:
             self.enterprise_window.show()
+            self.enterprise_ssid.focus()
             return
 
         self.enterprise_ssid = toga.TextInput(style=Pack(flex=1))
@@ -847,6 +898,7 @@ class AccessibleWifi(toga.App):
         self.enterprise_window.content = content
         self.enterprise_window.show()
         self.enterprise_method_changed(self.enterprise_method)
+        self.enterprise_ssid.focus()
 
     def enterprise_method_changed(self, widget: toga.Selection) -> None:
         is_tls = (
@@ -999,7 +1051,7 @@ class AccessibleWifi(toga.App):
             await self.handle_connection_result(ssid)
             await self.scan_for_networks()
         except NmcliError as error:
-            await self.delete_profile(profile)
+            await self.cleanup_failed_profile(profile)
             self.set_status(f"Enterprise connection failed: {error}")
             await self.show_error(
                 "Could not connect",
@@ -1013,6 +1065,7 @@ class AccessibleWifi(toga.App):
     def show_wep_window(self, widget: toga.Widget) -> None:
         if self.wep_window is not None:
             self.wep_window.show()
+            self.wep_ssid.focus()
             return
 
         self.wep_ssid = toga.TextInput(style=Pack(flex=1))
@@ -1082,6 +1135,7 @@ class AccessibleWifi(toga.App):
         )
         self.wep_window.content = content
         self.wep_window.show()
+        self.wep_ssid.focus()
 
     def close_wep_window(self, widget: toga.Widget) -> None:
         if self.wep_window is not None:
@@ -1151,7 +1205,7 @@ class AccessibleWifi(toga.App):
             await self.handle_connection_result(ssid)
             await self.scan_for_networks()
         except NmcliError as error:
-            await self.delete_profile(profile)
+            await self.cleanup_failed_profile(profile)
             self.set_status(f"WEP connection failed: {error}")
             await self.show_error(
                 "Could not connect",
