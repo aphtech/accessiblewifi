@@ -294,8 +294,11 @@ class AccessibleWifi(toga.App):
         self.main_window = toga.MainWindow(
             title="Accessible Wi-Fi Setup",
             size=(760, 560),
+            resizable=True,
         )
-        self.main_window.content = content
+        self.main_window.content = toga.ScrollContainer(
+            content=content, horizontal=True, style=Pack(flex=1)
+        )
         self.main_window.show()
 
         asyncio.create_task(self.initial_scan())
