@@ -40,6 +40,13 @@ import toga
 from toga.style import Pack
 from toga.style.pack import COLUMN, ROW, CENTER
 
+# Escape-key handling below talks to GTK directly because Toga has no
+# cross-platform API for a window-wide key handler. This project only ships
+# the GTK 3 backend (see pyproject.toml's gir1.2-gtk-3.0 runtime requirement).
+import gi
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk
+
 env = os.environ.copy()
 env["DISPLAY"] = env.get("DISPLAY", ":0")
 
@@ -81,6 +88,26 @@ ORCA_SPEAK_COMMAND = [
 
 class NmcliError(RuntimeError):
     pass
+
+
+def make_escape_close_handler(
+    close: Callable[[], None],
+) -> Callable[[object, object], bool]:
+    """Build a GTK key-press-event handler that calls `close` on Escape.
+
+    Connecting this to a window's native GTK widget catches Escape no matter
+    which child widget currently has keyboard focus, since GTK delivers key
+    events to the top-level window before dispatching them to the focused
+    child.
+    """
+
+    def handle_key_press(_widget, event) -> bool:
+        if event.keyval == Gdk.KEY_Escape:
+            close()
+            return True
+        return False
+
+    return handle_key_press
 
 
 class RevealablePasswordInput:
@@ -362,6 +389,9 @@ class AccessibleWifi(toga.App):
         )
         self.main_window.content = content
         self.main_window.show()
+        self.main_window._impl.native.connect(
+            "key-press-event", make_escape_close_handler(self.main_window.close)
+        )
 
         asyncio.create_task(self.initial_scan())
 
