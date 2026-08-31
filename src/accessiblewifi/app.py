@@ -139,6 +139,15 @@ class RevealablePasswordInput:
             on_change=self._show_changed,
             style=Pack(margin_top=3, margin_bottom=8, flex=1),
         )
+        # Toga has no cross-platform accessible-name API for a Switch, and
+        # GTK's own accessible object for it only exposes "toggle button"
+        # with no name — the adjacent Gtk.Label is a separate widget that a
+        # screen reader does not read as this control's name. Set the name
+        # on the native switch directly so it announces "Show password,
+        # toggle button, not pressed" instead of just "toggle button".
+        self.show_switch._impl.native_switch.get_accessible().set_name(
+            "Show password"
+        )
 
         self.box = toga.Box(
             children=[self.entry, self.show_switch],
