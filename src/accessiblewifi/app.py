@@ -713,15 +713,26 @@ class AccessibleWifi(toga.App):
         await self.run_nmcli(*args, timeout=30)
 
         if key_management:
-            await self.run_nmcli(
+            modify_args = [
                 "connection",
                 "modify",
                 "id",
                 profile_name,
                 "802-11-wireless-security.key-mgmt",
                 key_management,
-                timeout=30,
-            )
+            ]
+            if key_management in {"wpa-psk", "sae"}:
+                # Explicitly mark the PSK as stored in NetworkManager's own
+                # (system-connection) storage rather than agent-owned. If
+                # this flag ends up non-zero, NetworkManager ignores the
+                # secret supplied via `passwd-file` at activation time and
+                # instead queries registered desktop secret agents (e.g. the
+                # GNOME keyring), which is exactly the unwanted keyring
+                # prompt this app must avoid.
+                modify_args.extend(
+                    ["802-11-wireless-security.psk-flags", "0"]
+                )
+            await self.run_nmcli(*modify_args, timeout=30)
 
     async def refresh_networks(self, widget: toga.Widget) -> None:
         await self.scan_for_networks()
@@ -1316,7 +1327,13 @@ class AccessibleWifi(toga.App):
                 modify.extend(["802-1x.domain-suffix-match", domain])
 
             if eap in {"peap", "ttls"}:
-                modify.extend(["802-1x.phase2-auth", inner])
+                # Explicit flags=0 so NetworkManager treats the account
+                # password as stored in the system connection (supplied via
+                # `passwd-file` at activation) instead of delegating to a
+                # desktop secret agent, matching the WPA-Personal PSK fix.
+                modify.extend(
+                    ["802-1x.phase2-auth", inner, "802-1x.password-flags", "0"]
+                )
             else:
                 modify.extend(
                     [
@@ -1324,6 +1341,8 @@ class AccessibleWifi(toga.App):
                         client_cert,
                         "802-1x.private-key",
                         private_key,
+                        "802-1x.private-key-password-flags",
+                        "0",
                     ]
                 )
 
@@ -1494,6 +1513,8 @@ class AccessibleWifi(toga.App):
                     key_type,
                     "802-11-wireless-security.wep-tx-keyidx",
                     key_index,
+                    "802-11-wireless-security.wep-key-flags",
+                    "0",
                     timeout=30,
                 )
 
