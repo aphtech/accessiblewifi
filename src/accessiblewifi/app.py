@@ -38,6 +38,7 @@ from .screen_size import ScreenSize
 from .wifi_commands import define_wifi_commands
 
 import toga
+from toga import (Group)
 from toga.style import Pack
 from toga.style.pack import COLUMN, ROW, CENTER
 
@@ -235,8 +236,12 @@ class AccessibleWifi(toga.App):
         self.enterprise_window: toga.Window | None = None
         self.wep_window: toga.Window | None = None
         
+        define_wifi_commands(self)
+        
         Group.APP._text = "_Accessible Wi-Fi"
         Group.HELP._text = "_Help"
+        
+        print(list(self.app.commands.keys()))
 
         screen = ScreenSize()
         iswidth = screen.get_width()
