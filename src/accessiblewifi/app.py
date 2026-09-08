@@ -35,6 +35,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from .screen_size import ScreenSize
+from .wifi_commands import define_wifi_commands
 
 import toga
 from toga.style import Pack
@@ -233,6 +234,9 @@ class AccessibleWifi(toga.App):
         self.hidden_window: toga.Window | None = None
         self.enterprise_window: toga.Window | None = None
         self.wep_window: toga.Window | None = None
+        
+        Group.APP._text = "_Accessible Wi-Fi"
+        Group.HELP._text = "_Help"
 
         screen = ScreenSize()
         iswidth = screen.get_width()
