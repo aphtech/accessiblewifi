@@ -63,10 +63,23 @@ Everything lives in `src/accessiblewifi/app.py` (one `toga.App` subclass, `Acces
   and selection/input widgets during an in-flight `nmcli` operation and restores them afterward via
   `network_changed`. Any new long-running operation should route through `set_busy` rather than managing
   widget `enabled` state ad hoc.
-- **Captive portal handling**: `get_connectivity()` calls `nmcli networking connectivity check` and
-  `report_connectivity()` maps the result (`full`/`portal`/`limited`/`none`/`unknown`) to status text and,
-  where relevant, a confirm dialog offering to open `PORTAL_URL` in a browser via
-  `launch_portal_browser()`.
+- **Captive portal handling**: detection is done *in the app*, not by NetworkManager.
+  `get_connectivity()` runs the `PORTAL_PROBES` concurrently — plain-HTTP requests to endpoints with a
+  known fixed response (`generate_204` and friends) — and returns a `ConnectivityResult`
+  (`full`/`portal`/`none`, plus the portal's own sign-in address when it sent one). Do **not** go back to
+  `nmcli networking connectivity check` here: NetworkManager's connectivity checking is disabled unless a
+  file under `/etc/NetworkManager/conf.d` sets `connectivity.uri` (it is off by default on the target
+  devices, and while off NM answers `full` unconditionally, so every captive network looks online), and
+  forcing a recheck is a PolicyKit-guarded D-Bus call that fails with "Not authorized to recheck
+  connectivity". Both fixes would be system-wide changes this app must not make.
+  `report_connectivity()` maps the result to status text and, for anything other than `full`, a confirm
+  dialog offering to open the sign-in page. `launch_portal_browser()` starts a real browser from
+  `BROWSER_COMMANDS` (Firefox first) with `asyncio.create_subprocess_exec`, detached via
+  `start_new_session=True` and given `BROWSER_ENV` so it reaches the desktop session; it deliberately does
+  not use Python's `webbrowser`, which silently falls back to a terminal browser and blocks when
+  `DISPLAY`/`WAYLAND_DISPLAY` are missing from the app's own environment. A redirect target read from a
+  `Location` header is untrusted network input and must always go through `safe_portal_url()` (http/https
+  only) before it reaches a browser.
 
 `__main__.py` and the `main()` function at the bottom of `app.py` are the two entry points Briefcase wires
 up; keep both working since Briefcase invokes the module both ways depending on target platform.
@@ -77,5 +90,7 @@ A security/accessibility review (`review.md` at repo root) is already on record 
 read it before making security- or accessibility-related changes here, since it documents intentional
 design decisions (e.g. `PORTAL_URL` being plain HTTP is deliberate, not a bug) alongside real gaps (e.g.
 CA certificate validation being optional for Enterprise networks, and some status-only paths not reliably
-reaching assistive tech). Test coverage is currently just a placeholder (`tests/test_app.py`) — none of the
-SSID parsing/validation/classification logic is regression-protected yet.
+reaching assistive tech). Tests live in `tests/test_wifi_connection.py` (connection flows, SSID parsing and
+classification, secret handling) and `tests/test_captive_portal.py` (portal detection, redirect vetting,
+browser launch); `tests/test_app.py` still holds the GTK-widget tests. They all run headless against a
+recording harness rather than a live Toga app — follow that pattern for new coverage.

@@ -29,11 +29,13 @@ import re
 import shutil
 import struct
 import tempfile
-import webbrowser
 from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
+from urllib import error as urllib_error
+from urllib import request as urllib_request
+from urllib.parse import urljoin, urlsplit
 from .screen_size import ScreenSize
 from .wifi_commands import define_wifi_commands
 
@@ -49,11 +51,82 @@ import gi
 gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk
 
-env = os.environ.copy()
-env["DISPLAY"] = env.get("DISPLAY", ":0")
+# The sign-in browser is launched into the desktop session, so it needs the
+# display variables even when the app itself was started from a context that
+# lacks them (a terminal over SSH, a systemd unit, a .desktop launcher with a
+# trimmed environment). Wayland is the session type on the target devices;
+# DISPLAY is still set for browsers that fall back to XWayland.
+BROWSER_ENV = os.environ.copy()
+BROWSER_ENV.setdefault("DISPLAY", ":0")
+BROWSER_ENV.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
 
+# Browsers tried, in order, when opening a captive-portal sign-in page.
+# Firefox is first because it is the browser shipped on the target devices and
+# the one their screen-reader users are set up for; x-www-browser and xdg-open
+# follow as the desktop's own configured default.
+#
+# Python's webbrowser module is deliberately not used here. It only registers
+# a GUI browser when DISPLAY or WAYLAND_DISPLAY is already set in this
+# process's environment, so under a launcher that dropped those it silently
+# falls back to a terminal browser (lynx via www-browser on Raspberry Pi OS)
+# and blocks forever in Popen.wait() instead of opening anything the user can
+# see. Naming the browser ourselves also lets us pass BROWSER_ENV.
+BROWSER_COMMANDS = (
+    "firefox",
+    "firefox-esr",
+    "x-www-browser",
+    "xdg-open",
+    "chromium",
+    "chromium-browser",
+)
 
+# How long a freshly launched browser is given to either fail or stay running.
+# A browser that is still alive after this has started up; one that is already
+# running hands the address to the existing window and exits 0 well inside it.
+BROWSER_STARTUP_SECONDS = 5
+
+# Fallback sign-in address, used when the probe below could not learn the real
+# portal address, and quoted to the user when they have to open a browser by
+# hand. Plain HTTP is deliberate and not an oversight: a captive portal can
+# only intercept and redirect unencrypted requests, so an https:// address
+# would fail to connect rather than land on the sign-in page. It is also kept
+# short because screen-reader users may have to type it from speech.
 PORTAL_URL = "http://example.com/"
+
+# Captive-portal detection is done in-app rather than by asking
+# NetworkManager, because `nmcli networking connectivity check` cannot do the
+# job on the target devices:
+#
+#   * NetworkManager's connectivity checking is off unless a system-wide file
+#     under /etc/NetworkManager/conf.d sets connectivity.uri, and while it is
+#     off NM answers "full" unconditionally - so a captive network looks
+#     identical to a working one and the sign-in page is never offered. This
+#     is the default state on Raspberry Pi OS.
+#   * Forcing a recheck is a privileged D-Bus call guarded by PolicyKit
+#     (org.freedesktop.NetworkManager.network-control). Where it is not
+#     granted it fails outright with "Not authorized to recheck
+#     connectivity"; where it is granted by prompting, it puts an admin
+#     password dialog in front of a user who only wanted to get online.
+#
+# Fixing either would mean a system-wide change this app must not make, so the
+# app instead runs the same unprivileged HTTP request NetworkManager would
+# have made, from its own process.
+PROBE_TIMEOUT_SECONDS = 5
+PROBE_BODY_LIMIT = 4096
+MAX_PORTAL_URL_LENGTH = 2048
+
+# Sent so that portals which only redirect what looks like a real browser
+# still redirect us, and so no cached answer is served instead of the
+# interception we are trying to detect.
+PROBE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux) AccessibleWifi captive-portal probe",
+    "Accept": "*/*",
+    "Cache-Control": "no-store, no-cache",
+    "Pragma": "no-cache",
+    "Connection": "close",
+}
+
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 # A short, quiet tick tone repeated in the background while a connection
 # attempt is in progress, so screen-reader users have a non-speech cue that
@@ -90,6 +163,158 @@ ORCA_SPEAK_COMMAND = [
 
 class NmcliError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class PortalProbe:
+    """One plain-HTTP address whose correct response is known in advance.
+
+    Anything else coming back - a redirect, a login page, a proxy's error -
+    means something on the network is intercepting traffic, which is what a
+    captive portal does.
+    """
+
+    url: str
+    expected_status: int
+    expected_body: str = ""
+
+
+# Several probes are used so one endpoint being down, blocked, or itself
+# behind a redirect cannot on its own be mistaken for a captive portal.
+PORTAL_PROBES = (
+    PortalProbe("http://connectivitycheck.gstatic.com/generate_204", 204),
+    PortalProbe("http://detectportal.firefox.com/success.txt", 200, "success"),
+    PortalProbe(
+        "http://nmcheck.gnome.org/check_network_status.txt",
+        200,
+        "NetworkManager is online",
+    ),
+)
+
+
+@dataclass(frozen=True)
+class ConnectivityResult:
+    """What the probes concluded about the current network.
+
+    `state` is "full" (the Internet is reachable), "portal" (something is
+    intercepting traffic, so a web sign-in is required), or "none" (nothing
+    answered at all). `portal_url` is the sign-in address to open, which is
+    the portal's own redirect target whenever it gave us one.
+    """
+
+    state: str
+    portal_url: str
+
+
+class _NoRedirectHandler(urllib_request.HTTPRedirectHandler):
+    """Stop urllib from following redirects during a probe.
+
+    The redirect is the detection: following it would land us on the portal's
+    login page and report an ordinary 200, hiding the very thing we are
+    looking for. Returning None makes urllib raise the 3xx as an HTTPError,
+    whose headers still carry the sign-in address.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def safe_portal_url(candidate: str | None, base: str) -> str | None:
+    """Vet a redirect target before it is ever handed to a browser.
+
+    The address arrives in a Location header written by whatever equipment is
+    intercepting this network, so it is untrusted input from an
+    unauthenticated source. Only absolute http/https addresses are allowed
+    through: a "file:", "data:", or "javascript:" target would make the app
+    open attacker-chosen content, and forcing a scheme also guarantees the
+    value cannot begin with "-" and be read as an option by the browser's own
+    argument parser.
+
+    Returns the vetted address, or None if it cannot be trusted - in which
+    case the caller falls back to PORTAL_URL, which a portal will intercept
+    just the same.
+    """
+    if not candidate:
+        return None
+
+    candidate = candidate.strip()
+    if not candidate or len(candidate) > MAX_PORTAL_URL_LENGTH:
+        return None
+
+    # A header value carrying control characters is malformed; refuse it
+    # rather than guess at what it was meant to say.
+    if any(character < " " or character == "\x7f" for character in candidate):
+        return None
+
+    try:
+        resolved = urljoin(base, candidate)
+        parts = urlsplit(resolved)
+    except ValueError:
+        return None
+
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        return None
+    return resolved
+
+
+def classify_probe_response(
+    probe: PortalProbe,
+    status: int,
+    location: str | None,
+    body: bytes,
+) -> tuple[str, str | None]:
+    """Decide what a single probe response says about this network.
+
+    Returns a (state, portal_url) pair, where portal_url is None whenever the
+    response did not name a sign-in address of its own.
+    """
+    text = body.decode("utf-8", errors="replace").strip()
+
+    if status == probe.expected_status and probe.expected_body in text:
+        return "full", None
+
+    # 511 is the status a standards-compliant portal returns to say
+    # "authenticate first"; a 3xx is what the common ones send instead.
+    if status in REDIRECT_STATUSES or status == 511:
+        return "portal", safe_portal_url(location, probe.url)
+
+    # Any other answer on plain HTTP - a login page served as 200, a proxy's
+    # error page - means the response did not come from the endpoint we
+    # asked, so treat it as interception with no known sign-in address.
+    return "portal", None
+
+
+def probe_connectivity(probe: PortalProbe, timeout: float) -> tuple[str, str | None]:
+    """Run one probe. Blocking, so call it from a worker thread.
+
+    Proxies are explicitly disabled so an http_proxy setting in the
+    environment cannot answer on the network's behalf and mask a portal.
+    """
+    opener = urllib_request.build_opener(
+        _NoRedirectHandler,
+        urllib_request.ProxyHandler({}),
+    )
+    request = urllib_request.Request(probe.url, headers=PROBE_HEADERS)
+
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return classify_probe_response(
+                probe,
+                response.status,
+                response.headers.get("Location"),
+                response.read(PROBE_BODY_LIMIT),
+            )
+    except urllib_error.HTTPError as error:
+        body = b""
+        with suppress(Exception):
+            body = error.read(PROBE_BODY_LIMIT)
+        location = error.headers.get("Location") if error.headers else None
+        return classify_probe_response(probe, error.code, location, body)
+    except Exception:
+        # DNS failure, refused connection, timeout, or a portal answering
+        # plain HTTP with something urllib cannot parse: nothing was
+        # reachable through this probe.
+        return "none", None
 
 
 def make_escape_close_handler(
@@ -235,6 +460,13 @@ class AccessibleWifi(toga.App):
         self.hidden_window: toga.Window | None = None
         self.enterprise_window: toga.Window | None = None
         self.wep_window: toga.Window | None = None
+
+        # Sign-in page state: the address the last connectivity check found
+        # (falling back to the generic probe address), whether that check
+        # found a portal at all, and the browsers we have launched.
+        self.portal_url: str = PORTAL_URL
+        self._portal_available = False
+        self._browser_processes: list[asyncio.subprocess.Process] = []
         
         define_wifi_commands(self)
         
@@ -541,6 +773,11 @@ class AccessibleWifi(toga.App):
             self.check_button,
         ):
             button.enabled = not busy
+
+        # The sign-in button is not a plain "on when idle" control: it is
+        # only meaningful once a connectivity check has found a portal, so it
+        # goes back to that state rather than to enabled.
+        self.portal_button.enabled = False if busy else self._portal_available
 
         if busy:
             self.network_selection.enabled = False
@@ -1545,147 +1782,206 @@ class AccessibleWifi(toga.App):
 
     # Captive portal
 
-    async def get_connectivity(self) -> str:
-        result = await self.run_nmcli(
-            "networking",
-            "connectivity",
-            "check",
-            timeout=45,
-        )
-        value = result.strip().lower()
-        return value if value in {
-            "full",
-            "portal",
-            "limited",
-            "none",
-            "unknown",
-        } else "unknown"
+    async def get_connectivity(self) -> ConnectivityResult:
+        """Work out whether this network is usable, captive, or dead.
+
+        Every probe is run at once so the answer arrives in about one probe
+        timeout rather than three, and a single "full" is conclusive: a
+        captive portal has to intercept every plain-HTTP request to do its
+        job, so if even one probe got its exact expected answer back, nothing
+        is standing in the way.
+
+        This never raises. A failure to probe is itself an answer ("none"),
+        and the caller is on a connection-result path where an unhandled
+        exception would leave the user with no spoken outcome at all.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            outcomes = await asyncio.wait_for(
+                asyncio.gather(
+                    *(
+                        loop.run_in_executor(
+                            None,
+                            probe_connectivity,
+                            probe,
+                            PROBE_TIMEOUT_SECONDS,
+                        )
+                        for probe in PORTAL_PROBES
+                    )
+                ),
+                timeout=PROBE_TIMEOUT_SECONDS * 2,
+            )
+        except Exception:
+            return ConnectivityResult("none", PORTAL_URL)
+
+        portal_url: str | None = None
+        saw_portal = False
+
+        for state, url in outcomes:
+            if state == "full":
+                return ConnectivityResult("full", PORTAL_URL)
+            if state == "portal":
+                saw_portal = True
+                if url and portal_url is None:
+                    portal_url = url
+
+        if saw_portal:
+            return ConnectivityResult("portal", portal_url or PORTAL_URL)
+        return ConnectivityResult("none", PORTAL_URL)
+
+    def set_portal_available(self, available: bool) -> None:
+        """Record whether a sign-in page is worth offering, and reflect it on
+        the button. The flag is kept because `set_busy` has to switch the
+        button off during an operation and then put it back the way the last
+        connectivity check left it."""
+        self._portal_available = available
+        self.portal_button.enabled = available
 
     async def handle_connection_result(self, ssid: str) -> None:
         self.set_status(f"Connected to {ssid}. Checking Internet access.")
+        # Give NetworkManager a moment to finish bringing up DHCP and DNS;
+        # probing before that would look like a dead network.
         await asyncio.sleep(3)
-
-        try:
-            connectivity = await self.get_connectivity()
-        except NmcliError as error:
-            self.portal_button.enabled = True
-            self.set_status(
-                f"Connected to {ssid}, but Internet access could not be "
-                f"checked: {error}"
-            )
-            return
-
-        await self.report_connectivity(connectivity, ssid)
+        await self.report_connectivity(await self.get_connectivity(), ssid)
 
     async def report_connectivity(
         self,
-        connectivity: str,
+        result: ConnectivityResult,
         ssid: str | None = None,
     ) -> None:
         name = ssid or "the current network"
+        self.portal_url = result.portal_url
 
-        if connectivity == "full":
-            self.portal_button.enabled = False
+        if result.state == "full":
+            self.set_portal_available(False)
             self.set_status(
                 f"Connected to {name}. Internet access is available."
             )
             return
 
-        self.portal_button.enabled = True
+        self.set_portal_available(True)
 
-        if connectivity == "portal":
+        if result.state == "portal":
             self.set_status(
-                f"Connected to {name}. A web sign-in is required."
+                f"Connected to {name}. A web sign-in is required before you "
+                "can use the Internet."
             )
-            open_page = await self.main_window.dialog(
-                toga.ConfirmDialog(
-                    "Wi-Fi sign-in required",
-                    f"{name} requires a web-page sign-in. Open it now?",
-                )
+            title = "Wi-Fi sign-in required"
+            message = (
+                f"{name} requires a web-page sign-in before it will allow "
+                "Internet access. Open the sign-in page now?"
             )
-            if open_page:
-                await self.launch_portal_browser()
-        elif connectivity == "limited":
-            self.set_status(
-                f"Connected to {name}, but Internet access is limited."
-            )
-            open_page = await self.main_window.dialog(
-                toga.ConfirmDialog(
-                    "Limited Internet access",
-                    "A captive-portal sign-in may be required. Open a "
-                    "sign-in page?",
-                )
-            )
-            if open_page:
-                await self.launch_portal_browser()
-        elif connectivity == "none":
+        else:
+            # Nothing answered at all. That is often simply a network with no
+            # working Internet, but portals that drop traffic instead of
+            # redirecting it look exactly the same from here, so the sign-in
+            # page is still worth offering.
             self.set_status(
                 f"Connected to {name}, but no Internet access was detected."
             )
-        else:
-            self.set_status(
-                f"Connected to {name}. Internet status is unknown."
+            title = "No Internet access"
+            message = (
+                f"No Internet access was detected on {name}. Some networks "
+                "block all traffic until you sign in on a web page. Open a "
+                "sign-in page now?"
             )
-            open_page = await self.main_window.dialog(
-                toga.ConfirmDialog(
-                    "Internet status unknown",
-                    "Internet access could not be confirmed. Some networks "
-                    "require a web-page sign-in that could not be detected "
-                    "automatically. Open a sign-in page?",
-                )
-            )
-            if open_page:
-                await self.launch_portal_browser()
+
+        open_page = await self.main_window.dialog(
+            toga.ConfirmDialog(title, message)
+        )
+        if open_page:
+            await self.launch_portal_browser(result.portal_url)
 
     async def open_portal_page(self, widget: toga.Widget) -> None:
         await self.launch_portal_browser()
 
-    async def launch_portal_browser(self) -> None:
-        # webbrowser.open() is not guaranteed non-blocking: on some systems
-        # (no DISPLAY/WAYLAND_DISPLAY, an unusual BROWSER setting, or no GUI
-        # browser registered) it falls back to a controller that calls
-        # subprocess.Popen(...).wait() and can hang indefinitely. Toga's UI
-        # and accessibility responses run on this same event loop thread, so
-        # calling it directly can freeze the whole app. Run it in a worker
-        # thread with a timeout so a hang there can't freeze the app.
-        loop = asyncio.get_running_loop()
-        try:
-            opened = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None, webbrowser.open, PORTAL_URL, 1, True
-                ),
-                timeout=10,
-            )
-            details = "The desktop did not report that a browser was opened."
-        except asyncio.TimeoutError:
-            opened = False
-            details = (
-                "Opening a browser is taking longer than expected. It may "
-                "still open in the background."
-            )
-        except Exception as error:
-            opened = False
-            details = str(error)
+    @staticmethod
+    def browser_command() -> str | None:
+        for command in BROWSER_COMMANDS:
+            path = shutil.which(command, path=BROWSER_ENV.get("PATH"))
+            if path:
+                return path
+        return None
 
-        if opened:
+    async def launch_portal_browser(self, url: str | None = None) -> None:
+        """Open the sign-in page in a browser, without blocking the app.
+
+        The browser is started detached in its own session so it outlives
+        this app, and is only waited on long enough to notice it failing
+        immediately. A browser that is still running when that wait expires
+        has started successfully; one that was already running will have
+        handed the address to its existing window and exited 0 long before.
+        """
+        target = url or self.portal_url or PORTAL_URL
+        command = self.browser_command()
+
+        if command is None:
+            await self.show_error(
+                "No browser found",
+                "No web browser could be found on this device, so the "
+                "sign-in page could not be opened. Install Firefox, then "
+                f"visit {PORTAL_URL} to sign in.",
+            )
+            return
+
+        browser_name = Path(command).name
+        self.set_status(f"Opening the Wi-Fi sign-in page in {browser_name}.")
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                command,
+                target,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+                env=BROWSER_ENV,
+            )
+        except OSError as error:
+            await self.show_error(
+                "Could not open the sign-in page",
+                f"{browser_name} could not be started: {error}\n\n"
+                f"Open a browser and visit {PORTAL_URL} to sign in.",
+            )
+            return
+
+        # Hold a reference to the running browser so its transport is not
+        # garbage collected out from under the event loop before the child
+        # is reaped. Finished ones are dropped on the next launch.
+        self._browser_processes = [
+            running
+            for running in getattr(self, "_browser_processes", [])
+            if running.returncode is None
+        ]
+        self._browser_processes.append(process)
+
+        try:
+            returncode = await asyncio.wait_for(
+                asyncio.shield(process.wait()),
+                timeout=BROWSER_STARTUP_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            # Still running, which for a browser means it opened.
+            returncode = 0
+
+        if returncode == 0:
             self.set_status(
-                "A browser was launched for the sign-in page. If it did not "
-                "appear, open one manually and visit "
-                f"{PORTAL_URL}. After signing in, return and press Check "
+                f"The Wi-Fi sign-in page was opened in {browser_name}. Sign "
+                "in there, then return to this window and press Check "
                 "Internet Again."
             )
         else:
             await self.show_error(
-                "Could not open browser",
-                f"Open a browser and visit {PORTAL_URL}\n\n{details}",
+                "Could not open the sign-in page",
+                f"{browser_name} exited with an error, so the sign-in page "
+                "may not have appeared. Open a browser and visit "
+                f"{PORTAL_URL} to sign in.",
             )
 
     async def check_internet_again(self, widget: toga.Widget) -> None:
         self.set_busy(True, "Checking Internet access.")
         try:
             await self.report_connectivity(await self.get_connectivity())
-        except NmcliError as error:
-            await self.show_error("Internet check failed", str(error))
         finally:
             self.set_busy(False)
 
