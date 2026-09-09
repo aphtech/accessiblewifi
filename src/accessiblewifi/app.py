@@ -1626,23 +1626,53 @@ class AccessibleWifi(toga.App):
             self.set_status(
                 f"Connected to {name}. Internet status is unknown."
             )
+            open_page = await self.main_window.dialog(
+                toga.ConfirmDialog(
+                    "Internet status unknown",
+                    "Internet access could not be confirmed. Some networks "
+                    "require a web-page sign-in that could not be detected "
+                    "automatically. Open a sign-in page?",
+                )
+            )
+            if open_page:
+                await self.launch_portal_browser()
 
     async def open_portal_page(self, widget: toga.Widget) -> None:
         await self.launch_portal_browser()
 
     async def launch_portal_browser(self) -> None:
+        # webbrowser.open() is not guaranteed non-blocking: on some systems
+        # (no DISPLAY/WAYLAND_DISPLAY, an unusual BROWSER setting, or no GUI
+        # browser registered) it falls back to a controller that calls
+        # subprocess.Popen(...).wait() and can hang indefinitely. Toga's UI
+        # and accessibility responses run on this same event loop thread, so
+        # calling it directly can freeze the whole app. Run it in a worker
+        # thread with a timeout so a hang there can't freeze the app.
+        loop = asyncio.get_running_loop()
         try:
-            opened = webbrowser.open(PORTAL_URL, new=1, autoraise=True)
+            opened = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, webbrowser.open, PORTAL_URL, 1, True
+                ),
+                timeout=10,
+            )
+            details = "The desktop did not report that a browser was opened."
+        except asyncio.TimeoutError:
+            opened = False
+            details = (
+                "Opening a browser is taking longer than expected. It may "
+                "still open in the background."
+            )
         except Exception as error:
             opened = False
             details = str(error)
-        else:
-            details = "The desktop did not report that a browser was opened."
 
         if opened:
             self.set_status(
-                "The sign-in page was opened. After signing in, return and "
-                "press Check Internet Again."
+                "A browser was launched for the sign-in page. If it did not "
+                "appear, open one manually and visit "
+                f"{PORTAL_URL}. After signing in, return and press Check "
+                "Internet Again."
             )
         else:
             await self.show_error(
